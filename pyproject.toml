@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "autocode-cli"
+name = "empero-autocode"
 version = "0.1.0"
 description = "A minimal, self-modifying coding agent for any OpenAI-compatible endpoint."
 readme = "README.md"

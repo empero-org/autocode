@@ -8,7 +8,7 @@ A minimal coding agent that lives in your project as one Python file and is
 allowed to rewrite itself.
 
 ```bash
-pip install autocode-cli
+pip install empero-autocode
 cd my-project
 autocode                 # the first time, a short setup picks the backend and model
 ```
