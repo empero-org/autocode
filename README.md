@@ -26,7 +26,7 @@ its own copy, so each project's agent can evolve on its own.
 ## The idea
 
 - **One file, stdlib only.** `runner.py` is the whole agent: an agent loop,
-  streaming client, sessions, compaction and REPL, in about 640 lines. You can
+  streaming client, sessions, compaction and REPL, in about 830 lines. You can
   also run it directly with `python runner.py`.
 - **One built-in tool: `bash`.** Commands run as written. The working directory
   persists between calls, stdin is closed, and there's a timeout. Long output
@@ -62,8 +62,10 @@ its own copy, so each project's agent can evolve on its own.
     the conversation as a plain transcript and no tools.
   - If compaction fails, the agent says so and keeps working.
   - Full transcripts are kept in `.autocode/sessions/old/`.
-- **A minimal system prompt.** It is three sentences, plus `AGENTS.md` (or
-  `CLAUDE.md`) if the project has one.
+- **A minimal system prompt.** It is three lines, plus `AGENTS.md` (or
+  `CLAUDE.md`) if the project has one. The first line tells the model that a
+  person is at the keyboard, so when a request is ambiguous it asks instead
+  of guessing.
 - **Readable output.** Replies render as they stream: markdown headings,
   lists, quotes and tables, syntax-highlighted code blocks, and LaTeX math as
   Unicode (`\frac{1}{2}\alpha^2` becomes `½α²`). Your messages appear as a
@@ -106,8 +108,19 @@ autocode --diff                  # how has this project's runner drifted from th
 autocode --reset                 # restore the original runner.py (old one → .autocode/runner.prev.py)
 ```
 
-In the REPL: `/compact`, `/new`, `/exit`. End a line with `\` to continue it
-on the next line. Ctrl-C interrupts the current turn, and Ctrl-D exits.
+In the REPL, `/help` lists the commands:
+
+| Command | What it does |
+|---|---|
+| `/model [name\|filter]` | Lists the server's models, or switches to one. It asks whether to keep the choice for this session (the default), this project, or all projects. |
+| `/config [key [value]]` | Shows every setting and where it comes from, or saves one to `.autocode/config.json`. `/config unset <key>` removes it again. |
+| `/reset` | Updates `runner.py` to the installed version, backs yours up to `.autocode/runner.prev.py`, and reloads. |
+| `/compact` | Summarizes the conversation now. |
+| `/new` | Starts a new session. |
+| `/exit` | Quits (so does Ctrl-D). |
+
+End a line with `\` to continue it on the next line. Ctrl-C interrupts the
+current turn.
 
 > ⚠️ autocode runs bash as written and rewrites its own source. Use it in a
 > sandbox or on projects where a mistake is acceptable — the safety features

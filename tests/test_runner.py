@@ -23,13 +23,16 @@ def tool_call(name, **args):
 class FakeServer:
     """Answers each /chat/completions request with the next scripted reply, streamed as SSE."""
 
-    def __init__(self, replies, stream=True):
-        self.replies, self.requests = list(replies), []
+    def __init__(self, replies, stream=True, models=()):
+        self.replies, self.requests, self.models = list(replies), [], list(models)
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
+
+            def do_GET(self):  # /models
+                self.send(200, "application/json", json.dumps({"data": [{"id": m} for m in server.models]}).encode())
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -146,6 +149,25 @@ class RunnerTest(unittest.TestCase):
         sent = server.requests[1]["messages"][2]
         self.assertEqual(sent["reasoning_details"], expected)  # merged, and sent back for the tool loop
         self.assertNotIn("reasoning", sent)  # the plain text copy stays local unless keep_reasoning
+
+    def test_resume_does_not_rerun_an_interrupted_turn(self):
+        sessions = self.dir / ".autocode" / "sessions"
+        sessions.mkdir(parents=True)
+        old = [{"role": "user", "content": "old task"},
+               {"role": "assistant", "content": None, "tool_calls": [
+                   {"id": "a", "type": "function", "function": {"name": "bash", "arguments": '{"command": "true"}'}}]},
+               {"role": "tool", "tool_call_id": "a", "content": "[interrupted by user]"}]
+        (sessions / "s1.jsonl").write_text("".join(json.dumps(m) + "\n" for m in old))
+        server = FakeServer(["Sure."])
+        proc = self.run_agent(server, "-c", "new question")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(server.requests), 1)  # only the new question, not a replay of the old turn
+        self.assertEqual(server.requests[0]["messages"][-1]["content"], "new question")
+
+    def test_system_prompt_invites_questions(self):
+        server = FakeServer(["ok"])
+        self.run_agent(server, "hi")
+        self.assertIn("end your turn and ask", server.requests[0]["messages"][0]["content"])
 
     def test_non_streaming_server(self):
         server = FakeServer([tool_call("bash", command="echo ok"), "Fine."], stream=False)

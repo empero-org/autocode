@@ -32,7 +32,7 @@ HOME = ROOT / ".autocode"  # config.json, sessions/, tools/, out/
 START_SRC = SELF.read_text()
 
 SYSTEM = """\
-You are autocode, a coding agent working in {root} ({os}, {date}). Work autonomously until the task is done, verifying as you go, then reply briefly.
+You are autocode, a coding agent working in {root} ({os}, {date}), with a person at the keyboard. Work until the task is done, verifying as you go, then reply briefly. If the request is ambiguous or a decision is theirs to make, end your turn and ask instead of assuming.
 Your implementation is {self}, a single Python file you may improve; edits take effect after each step. Your state (config, sessions, tools) lives in {home}.
 To add a tool, write {home}/tools/<name>.py defining SCHEMA (an OpenAI function schema) and run(**args) -> str; it is available from the next step."""
 
@@ -55,21 +55,55 @@ DEFAULTS = {
 }
 
 
-def load_config(model=None):
-    cfg = dict(DEFAULTS, base_url=os.environ.get("OPENAI_BASE_URL", DEFAULTS["base_url"]),
-               api_key=os.environ.get("OPENAI_API_KEY", ""))
-    for path in (Path.home() / ".config" / "autocode" / "config.json", HOME / "config.json"):
+GLOBAL_CONFIG = Path.home() / ".config" / "autocode" / "config.json"
+PROJECT_CONFIG = HOME / "config.json"
+OVERRIDES = {}  # this session only: -m and /model
+
+
+def config_layers():
+    """Where settings come from, lowest priority first: [(source, {key: value})]."""
+    layers = [("default", dict(DEFAULTS)),
+              ("OPENAI_* env", {key: os.environ[var] for key, var in (("base_url", "OPENAI_BASE_URL"),
+                                                                     ("api_key", "OPENAI_API_KEY"))
+                                if os.environ.get(var)})]
+    for path in (GLOBAL_CONFIG, PROJECT_CONFIG):
         if path.exists():
-            cfg.update(json.loads(path.read_text()))
+            layers.append((short(path), json.loads(path.read_text())))
+    env = {}
     for key, default in DEFAULTS.items():  # every option can be set as AUTOCODE_<KEY>
-        env = os.environ.get("AUTOCODE_" + key.upper())
-        if env is not None:
-            cfg[key] = env if isinstance(default, str) else json.loads(env)
-    if model:
-        cfg["model"] = model
+        value = os.environ.get("AUTOCODE_" + key.upper())
+        if value is not None:
+            env[key] = value if isinstance(default, str) else json.loads(value)
+    return layers + [("AUTOCODE_* env", env), ("this session", OVERRIDES)]
+
+
+def load_config():
+    cfg = {}
+    for _, layer in config_layers():
+        cfg.update(layer)
     cfg["api_key"] = os.path.expandvars(cfg["api_key"])
     cfg["headers"] = {k: os.path.expandvars(v) for k, v in cfg["headers"].items()}
     return cfg
+
+
+def refresh(cfg):
+    cfg.clear()
+    cfg.update(load_config())
+
+
+def save_setting(path, key, value=None, unset=False):
+    settings = json.loads(path.read_text()) if path.exists() else {}
+    if unset:
+        settings.pop(key, None)
+    else:
+        settings[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n")
+    path.chmod(0o600)  # it may hold an API key
+
+
+def short(path):
+    return str(path).replace(str(ROOT) + os.sep, "").replace(str(Path.home()), "~", 1)
 
 
 # ---------------------------------------------------------------- terminal
@@ -84,7 +118,7 @@ except ImportError:
             self.kind = None
 
         def banner(self, model, session, cwd):
-            print(f"autocode · {model} · session {session} · /compact /new /exit", file=sys.stderr)
+            print(f"autocode · {model} · session {session} · /help for commands", file=sys.stderr)
 
         def ask(self, meter):
             line = input(f"\n{meter} > ")
@@ -538,8 +572,16 @@ class Agent:
             return
         (HOME / "runner.prev.py").write_text(START_SRC)
         view.note(f"[{SELF.name} changed; reloading]", "magenta")
+        self.reload(continue_turn=True)
+
+    def reload(self, continue_turn=False):
+        """Re-exec this file and resume the session; continue_turn picks the running turn back up."""
         save_history()
-        os.execv(sys.executable, [sys.executable, str(SELF), "--resume", self.sid, *self.flags])
+        args = ["--resume", self.sid] if self.file.exists() else []
+        args += ["--continue-turn"] if continue_turn else []
+        args += ["--print"] if "--print" in self.flags else []
+        args += ["--model", OVERRIDES["model"]] if "model" in OVERRIDES else []
+        os.execv(sys.executable, [sys.executable, str(SELF), *args])
 
 
 # ---------------------------------------------------------------- CLI
@@ -566,24 +608,177 @@ def repl(agent):
             line = view.ask(f"{100 * agent.context() // agent.cfg['context_window']}%")
         except (EOFError, KeyboardInterrupt):
             break
-        command = line.strip()
-        if not command:
+        if not line.strip():
             continue
-        if command in ("/exit", "/quit"):
+        if line.strip() in ("/exit", "/quit"):
             break
-        if command == "/new":
-            agent = Agent(agent.cfg, flags=agent.flags)
-            view.note(f"new session {agent.sid}")
-        elif command == "/compact":
-            try:
-                agent.compact()
-            except (APIError, KeyboardInterrupt) as e:
-                view.note(f"[compaction failed] {e}", "red")
-        else:
+        try:
+            handled = slash(agent, line)
+        except (APIError, KeyboardInterrupt, EOFError) as e:
+            view.note(f"[{line.split()[0]} stopped] {e}".rstrip(), "red")
+            continue
+        if handled is None:
             agent.turn(line)
+        else:
+            agent = handled
     save_history()
     if agent.messages:
         view.note(f"session saved · resume with: autocode -r {agent.sid}")
+
+
+HELP = """\
+/help                  show this list
+/model [name|filter]   list the server's models, or switch (asks whether to keep it)
+/config [key [value]]  show settings and where they come from, or save one for this project
+/config unset <key>    remove a project setting
+/reset                 update runner.py to the installed version (yours is backed up) and reload
+/compact               summarize the conversation now
+/new                   start a new session
+/exit                  quit (or Ctrl-D) · end a line with \\ to continue it"""
+
+listed = []  # the models shown by the last /model, so that /model <number> can pick one
+
+
+def slash(agent, line):
+    """Run a slash command. Returns the agent to carry on with, or None if the line isn't a command."""
+    name, _, arg = line.strip().partition(" ")
+    arg = arg.strip()
+    if name == "/help":
+        view.note(HELP)
+    elif name == "/new":
+        agent = Agent(agent.cfg, flags=agent.flags)
+        view.note(f"new session {agent.sid}")
+    elif name == "/compact":
+        agent.compact()
+    elif name == "/model":
+        switch_model(agent.cfg, arg)
+    elif name == "/config":
+        configure(agent.cfg, arg)
+    elif name == "/reset":
+        update_runner(agent)
+    else:
+        return None
+    return agent
+
+
+def list_models(cfg):
+    headers = dict(cfg["headers"])
+    if cfg["api_key"]:
+        headers["Authorization"] = "Bearer " + cfg["api_key"]
+    request = urllib.request.Request(cfg["base_url"].rstrip("/") + "/models", headers=headers)
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return [m["id"] for m in json.loads(response.read()).get("data", []) if isinstance(m, dict) and m.get("id")]
+
+
+def show_models(models, current, header=""):
+    listed[:] = models[:30]
+    rows = [header] if header else []
+    rows += [f"{'●' if m == current else ' '} {i:>2}  {m}" for i, m in enumerate(listed, 1)]
+    if len(models) > len(listed):
+        rows.append(f"  … {len(models) - len(listed)} more; /model <text> filters")
+    view.note("\n".join(rows) + "\n/model <number or name> switches")
+
+
+def switch_model(cfg, arg):
+    if arg.isdigit() and 1 <= int(arg) <= len(listed):
+        choice = listed[int(arg) - 1]
+    else:
+        try:
+            models = list_models(cfg)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            if not arg:
+                return view.note(f"model: {cfg['model']} · couldn't list the server's models ({e})", "yellow")
+            models = [arg]  # can't check the name, so trust it
+        if not arg:
+            return show_models(models, cfg["model"], header=f"model: {cfg['model']}")
+        matches = [m for m in models if arg.lower() in m.lower()]
+        if arg in models:
+            choice = arg
+        elif len(matches) == 1:
+            choice = matches[0]
+        elif matches:
+            return show_models(matches, cfg["model"])
+        elif input(f"{arg} isn't listed by the server; use it anyway? [y/N] ").strip().lower().startswith("y"):
+            choice = arg
+        else:
+            return
+    where = input(f"Switch to {choice} for this [s]ession, this [p]roject, or all projects ([g]lobal)? [s] ")
+    where = where.strip().lower()[:1]
+    if where in ("p", "g"):
+        save_setting(PROJECT_CONFIG if where == "p" else GLOBAL_CONFIG, "model", choice)
+        OVERRIDES.pop("model", None)
+    else:
+        OVERRIDES["model"] = choice
+    refresh(cfg)
+    if cfg["model"] != choice:  # an AUTOCODE_MODEL variable outranks the files
+        OVERRIDES["model"] = choice
+        refresh(cfg)
+    kept = {"p": f"saved to {short(PROJECT_CONFIG)}", "g": f"saved to {short(GLOBAL_CONFIG)}"}.get(where, "this session")
+    view.note(f"model → {choice} · {kept}")
+
+
+def effective(key):
+    """(source, raw value) of a setting: the highest-priority layer that sets it."""
+    return next((source, layer[key]) for source, layer in reversed(config_layers()) if key in layer)
+
+
+def shown(key, value):
+    if key == "api_key" and value and not value.startswith("$"):
+        return value[:3] + "…" + value[-4:] if len(value) > 12 else "•••"
+    if key == "headers":
+        value = {k: v if str(v).startswith("$") else "•••" for k, v in value.items()}
+    return value if isinstance(value, str) and value else json.dumps(value)
+
+
+def configure(cfg, arg):
+    parts = arg.split(None, 1)
+    unset = parts[:1] == ["unset"] and len(parts) == 2
+    key = parts[1].strip() if unset else parts[0] if parts else None
+    if key and key not in DEFAULTS:
+        return view.note(f"unknown setting {key!r}; settings: {', '.join(DEFAULTS)}", "red")
+    if unset:
+        save_setting(PROJECT_CONFIG, key, unset=True)
+        refresh(cfg)
+        source, value = effective(key)
+        return view.note(f"{key} removed from {short(PROJECT_CONFIG)} · now {shown(key, value)} from {source}")
+    if len(parts) == 2:
+        try:
+            value = parts[1] if isinstance(DEFAULTS[key], str) else json.loads(parts[1])
+        except ValueError:
+            return view.note(f"{key} takes a JSON value: a number, true/false, null, or an object", "red")
+        save_setting(PROJECT_CONFIG, key, value)
+        refresh(cfg)
+        note = f"{key} = {shown(key, value)} · saved to {short(PROJECT_CONFIG)}"
+        if effective(key)[0] != short(PROJECT_CONFIG):
+            note += f" · {effective(key)[0]} still takes precedence"
+        if key == "api_key" and value and not value.startswith("$"):
+            note += " · tip: save a $VAR reference instead of the key itself"
+        return view.note(note)
+    rows = []
+    for k in [key] if key else DEFAULTS:
+        source, value = effective(k)
+        rows.append(f"{k:<15} {shown(k, value):<44} {source}")
+    view.note("\n".join(rows) + ("" if key else f"\n/config <key> <value> saves to {short(PROJECT_CONFIG)}"))
+
+
+def update_runner(agent):
+    """/reset: replace this file with the installed package's runner, keeping a backup, and reload."""
+    try:
+        spec = importlib.util.find_spec("autocode")
+    except (ImportError, ValueError):
+        spec = None
+    source = Path(spec.origin).with_name("runner.py") if spec and spec.origin else None
+    if not source or not source.exists() or source.resolve() == SELF:
+        return view.note("no installed autocode package to update from (pip install empero-autocode)", "red")
+    new, current = source.read_text(), SELF.read_text()
+    if new == current:
+        return view.note(f"runner.py is already the newest version ({source})")
+    HOME.mkdir(exist_ok=True)
+    (HOME / "runner.prev.py").write_text(current)
+    SELF.write_text(new)
+    view.note(f"runner.py updated from {source} · your previous version is in .autocode/runner.prev.py · "
+              "reloading", "magenta")
+    agent.reload()
 
 
 def main():
@@ -596,9 +791,12 @@ def main():
     parser.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the latest session")
     parser.add_argument("-r", "--resume", metavar="ID", help="resume a session by id")
     parser.add_argument("-m", "--model", help="override the configured model")
+    parser.add_argument("--continue-turn", action="store_true", help=argparse.SUPPRESS)  # set by reloads
     args = parser.parse_args()
 
-    cfg = load_config(args.model)
+    if args.model:
+        OVERRIDES["model"] = args.model
+    cfg = load_config()
     if not cfg["model"]:
         print('No model configured. Run `autocode --setup`, or set AUTOCODE_MODEL, or "model" in '
               ".autocode/config.json or ~/.config/autocode/config.json.", file=sys.stderr)
@@ -619,11 +817,10 @@ def main():
     if not sys.stdin.isatty():
         prompt = f"{prompt}\n\n{sys.stdin.read()}".strip()
 
-    flags = (["--print"] if args.print else []) + (["--model", args.model] if args.model else [])
-    agent = Agent(cfg, sid, flags)
+    agent = Agent(cfg, sid, ["--print"] if args.print else [])
     ok = True
-    if agent.messages and agent.messages[-1]["role"] in ("user", "tool"):  # resumed mid-turn, e.g. after a reload
-        ok = agent.turn()
+    if args.continue_turn and agent.messages and agent.messages[-1]["role"] in ("user", "tool"):
+        ok = agent.turn()  # reloaded mid-turn after editing itself: carry on
     if prompt:
         ok = agent.turn(prompt)
     if args.print:

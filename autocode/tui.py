@@ -602,7 +602,7 @@ class View:
         err(style("╭" + "─" * (inner + 2) + "╮", "gray"),
             *(style("│ ", "gray") + row + " " * (inner - vlen(row)) + style(" │", "gray") for row in rows),
             style("╰" + "─" * (inner + 2) + "╯", "gray"),
-            style("  /compact · /new · /exit · end a line with \\ to continue it", "gray"))
+            style("  /help for commands · end a line with \\ to continue it", "gray"))
 
     def ask(self, meter):
         """Read your message; on a terminal it is shown as a full-width gray bar."""
