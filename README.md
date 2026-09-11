@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/tui.png" alt="autocode starting up in a terminal">
+  <img src="https://raw.githubusercontent.com/empero-org/autocode/main/assets/tui.png" alt="autocode starting up in a terminal">
 </p>
 
 # autocode
@@ -8,7 +8,7 @@ A minimal coding agent that lives in your project as one Python file and is
 allowed to rewrite itself.
 
 ```bash
-pip install .            # or: pip install autocode, once published
+pip install autocode-cli
 cd my-project
 autocode                 # the first time, a short setup picks the backend and model
 ```
@@ -148,3 +148,10 @@ runner.py                 the agent (yours to change)
 ```bash
 python -m unittest discover tests   # end-to-end against a scripted fake server
 ```
+
+## License
+
+Apache-2.0: see [LICENSE](https://github.com/empero-org/autocode/blob/main/LICENSE). If you
+redistribute autocode or build on it, keep the attribution in
+[NOTICE](https://github.com/empero-org/autocode/blob/main/NOTICE), as Section 4(d) of the license
+requires.

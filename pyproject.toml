@@ -1,14 +1,30 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "autocode"
+name = "autocode-cli"
 version = "0.1.0"
 description = "A minimal, self-modifying coding agent for any OpenAI-compatible endpoint."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.9"
 dependencies = []
+keywords = ["agent", "coding-agent", "llm", "openai", "cli", "self-modifying"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/empero-org/autocode"
+Repository = "https://github.com/empero-org/autocode"
+Issues = "https://github.com/empero-org/autocode/issues"
 
 [project.scripts]
 autocode = "autocode.cli:main"
