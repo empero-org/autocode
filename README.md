@@ -74,6 +74,22 @@ its own copy, so each project's agent can evolve on its own.
   only). `runner.py` imports it when it's available and falls back to plain
   text, and output that isn't going to a terminal is left untouched. Try it
   on any file with `python -m autocode.tui README.md`.
+  
+## Safety
+
+autocode runs commands as written and can rewrite its own `runner.py` — that is
+the product, not a bug. It has no sandbox, no permission prompts, and no
+dry-run mode: a `bash` call is a real shell on your machine with your user and
+your environment, and the agent's edits take effect live, before the next model
+call.
+
+So run it where a mistake is acceptable. Use a container, a VM, or a throwaway
+copy of the project if the code or data in it matters. The same applies to any
+keys and credentials the shell can read: the agent can run `bash` and the tool
+it writes can too, so anything in your environment is in its reach. If that
+bothers you, keep `OPENAI_API_KEY` out of `AUTOCODE_`-style env expansion or
+run against a local server, and treat `runner.prev.py` as your rollback, not
+an undo button.
 
 ## Usage
 
@@ -92,6 +108,10 @@ autocode --reset                 # restore the original runner.py (old one → .
 
 In the REPL: `/compact`, `/new`, `/exit`. End a line with `\` to continue it
 on the next line. Ctrl-C interrupts the current turn, and Ctrl-D exits.
+
+> ⚠️ autocode runs bash as written and rewrites its own source. Use it in a
+> sandbox or on projects where a mistake is acceptable — the safety features
+> are `runner.prev.py` and your backups, nothing else.
 
 ## Configuration
 
