@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+
+# a local run of autocode inside this checkout
+/runner.py
+/.autocode/

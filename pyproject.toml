@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocode"
+version = "0.1.0"
+description = "A minimal, self-modifying coding agent for any OpenAI-compatible endpoint."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+autocode = "autocode.cli:main"
+
+[tool.setuptools]
+packages = ["autocode"]
