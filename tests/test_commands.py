@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_runner import RUNNER, FakeServer  # noqa: E402
+from test_runner import RUNNER, FakeServer, tool_call  # noqa: E402
 
 
 class CommandTest(unittest.TestCase):
@@ -29,10 +29,10 @@ class CommandTest(unittest.TestCase):
         self.r = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.r)
         self.r.GLOBAL_CONFIG = self.dir / "global.json"  # never touch the real ~/.config
-        self.err = io.StringIO()
-        redirect = contextlib.redirect_stderr(self.err)
-        redirect.__enter__()
-        self.addCleanup(redirect.__exit__, None, None, None)
+        self.err, self.out = io.StringIO(), io.StringIO()
+        for redirect in (contextlib.redirect_stderr(self.err), contextlib.redirect_stdout(self.out)):
+            redirect.__enter__()
+            self.addCleanup(redirect.__exit__, None, None, None)
         self.addCleanup(shutil.rmtree, self.dir)
 
     def test_settings_come_from_the_right_layer(self):
@@ -96,6 +96,32 @@ class CommandTest(unittest.TestCase):
         self.r.update_runner(agent)  # nothing newer: no reload
         self.assertEqual(reloads, [True])
         self.assertIn("already the newest", self.err.getvalue())
+
+    def test_steering_is_delivered_at_the_next_step(self):
+        agents = []
+
+        def while_working(body):  # you type while the model is busy...
+            agents[0].queue.append("use tabs, not spaces")
+            return tool_call("bash", command="true")
+
+        def while_finishing(body):  # ...and again just as it wraps up
+            agents[0].queue.append("also add a test")
+            return "Done."
+
+        server = FakeServer([while_working, while_finishing, "Test added."])
+        self.addCleanup(server.close)
+        self.r.save_setting(self.r.PROJECT_CONFIG, "base_url", server.url)
+        self.r.save_setting(self.r.PROJECT_CONFIG, "model", "m")
+        (self.r.HOME / "sessions").mkdir(parents=True, exist_ok=True)
+        agents.append(self.r.Agent(self.r.load_config()))
+        with mock.patch.object(self.r.view, "working", lambda deliver: contextlib.nullcontext()):
+            self.assertTrue(agents[0].turn("write a script"))
+        second, third = server.requests[1]["messages"], server.requests[2]["messages"]
+        self.assertEqual([m["role"] for m in second[-2:]], ["tool", "user"])  # after the tool, before the next call
+        self.assertEqual(second[-1]["content"], "use tabs, not spaces")
+        self.assertEqual(third[-1], {"role": "user", "content": "also add a test"})  # it kept going instead of stopping
+        self.assertEqual(len(server.requests), 3)
+        self.assertIn("use tabs, not spaces", self.err.getvalue())  # shown when delivered
 
     def test_help_and_non_commands(self):
         agent = object()

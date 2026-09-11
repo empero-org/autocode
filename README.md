@@ -26,7 +26,7 @@ its own copy, so each project's agent can evolve on its own.
 ## The idea
 
 - **One file, stdlib only.** `runner.py` is the whole agent: an agent loop,
-  streaming client, sessions, compaction and REPL, in about 830 lines. You can
+  streaming client, sessions, compaction and REPL, in about 860 lines. You can
   also run it directly with `python runner.py`.
 - **One built-in tool: `bash`.** Commands run as written. The working directory
   persists between calls, stdin is closed, and there's a timeout. Long output
@@ -121,6 +121,13 @@ In the REPL, `/help` lists the commands:
 
 End a line with `\` to continue it on the next line. Ctrl-C interrupts the
 current turn.
+
+To steer the agent while it works, just start typing. A prompt opens at the
+bottom and output pauses while you type. Enter queues the message, and Esc
+cancels it. A queued message reaches the model before its next step, right
+after the current reply and its tool calls. If the agent was about to finish,
+it carries on and answers your message. If the turn ends while you're still
+typing, your text moves into the normal prompt.
 
 > ⚠️ autocode runs bash as written and rewrites its own source. Use it in a
 > sandbox or on projects where a mistake is acceptable — the safety features

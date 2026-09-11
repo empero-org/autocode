@@ -5,11 +5,15 @@ installed and falls back to plain text otherwise.
 
     python -m autocode.tui README.md    # render a markdown file, streamed like a model reply
 """
+import codecs
+import contextlib
 import json
 import os
 import re
+import select
 import shutil
 import sys
+import threading
 
 COLOR = "FORCE_COLOR" in os.environ or (
     (sys.stdout.isatty() or sys.stderr.isatty()) and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
@@ -18,6 +22,7 @@ SGR = {"bold": (1, 22), "dim": (2, 22), "italic": (3, 23), "under": (4, 24), "st
        "red": (31, 39), "green": (32, 39), "yellow": (33, 39), "blue": (34, 39), "magenta": (35, 39),
        "cyan": (36, 39), "gray": (90, 39)}
 ANSI = re.compile(r"\x1b\[[0-9;]*m|\x1b\]8;;[^\x1b]*\x1b\\")
+CONTROL = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")  # every escape, not just colors
 
 
 def style(text, *names):
@@ -583,15 +588,48 @@ def err(*rows):
     print(*rows, sep="\n", file=sys.stderr, flush=True)
 
 
+class Gate:
+    """Stands in for stdout/stderr while the agent works, so a steering prompt can hold output back."""
+
+    def __init__(self, stream, view):
+        self.stream, self.view = stream, view
+
+    def write(self, text):
+        with self.view.lock:
+            if self.view.typing:
+                self.view.held.append((self.stream, text))
+            else:
+                self.stream.write(text)
+                self.view.track(text)
+        return len(text)
+
+    def flush(self):
+        with self.view.lock:
+            if not self.view.typing:
+                self.stream.flush()
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 class View:
     """Everything the agent shows, laid out as blocks separated by one blank line.
 
     The answer streams to stdout as rendered markdown; your messages, thinking,
-    tool calls and notes go to stderr.
+    tool calls and notes go to stderr. While the agent works you can type a
+    message to steer it; it is queued and delivered before the next step.
     """
 
     def __init__(self):
         self.kind, self.markdown, self.pending, self.thinking = None, None, "", False
+        self.lock, self.typing, self.held, self.draft, self.column = threading.Lock(), False, [], "", 0
+        self.active = None  # (fd, saved terminal mode, stop event, thread, (stdout, stderr)) while the agent works
 
     def banner(self, model, session, cwd):
         rows = [style("✻ ", "magenta") + style("autocode", "bold"), "",
@@ -606,6 +644,7 @@ class View:
 
     def ask(self, meter):
         """Read your message; on a terminal it is shown as a full-width gray bar."""
+        self._prefill()
         if not (COLOR and sys.stdin.isatty() and sys.stdout.isatty()):
             line = input(f"\n{meter} > ")
             while line.endswith("\\"):
@@ -626,10 +665,161 @@ class View:
                 break
         line = "\n".join(parts)
         sys.stderr.write(f"\x1b[{used}A\r\x1b[J")  # replace the typed lines with a clean bar
-        rows = [row for n, part in enumerate(line.split("\n"))
-                for row in wrap(part, cols - 3, (style("❯", "bold", "magenta") if n == 0 else " ") + " ", "  ")]
-        err(*(f"\x1b[{BAR}m {row}{' ' * max(0, cols - 2 - vlen(row))}\x1b[K\x1b[0m" for row in rows))
+        err(*self._bar(line, "❯"))
         return line
+
+    def _bar(self, text, mark):
+        """Rows of a full-width gray bar holding one of your messages."""
+        if not COLOR:
+            return [f"{mark} {text}"]
+        cols = width()
+        rows = [row for n, part in enumerate(text.split("\n"))
+                for row in wrap(part, cols - 3, (style(mark, "bold", "magenta") if n == 0 else " ") + " ", "  ")]
+        return [f"\x1b[{BAR}m {row}{' ' * max(0, cols - 2 - vlen(row))}\x1b[K\x1b[0m" for row in rows]
+
+    def _prefill(self):
+        """A steering message you were still typing when the turn ended starts off the next prompt."""
+        draft, self.draft = self.draft, ""
+        if not draft:
+            return
+        try:
+            import readline
+        except ImportError:
+            return
+
+        def hook():
+            readline.insert_text(draft)
+            readline.set_startup_hook(None)
+        readline.set_startup_hook(hook)
+
+    # -- steering: type while the agent works
+
+    def steered(self, text):
+        """Show a steering message as it is delivered to the model."""
+        self.end()
+        err("", *self._bar(text, "↳"))
+
+    def track(self, text):
+        """Follow the cursor's column, so a steering prompt can put it back exactly."""
+        cut = max(text.rfind("\n"), text.rfind("\r"))
+        shown = len(CONTROL.sub("", text[cut + 1:]))
+        self.column = shown if cut >= 0 else self.column + shown
+
+    @contextlib.contextmanager
+    def working(self, deliver):
+        """While the agent works, typing opens a steering prompt; Enter hands the message to deliver()."""
+        try:
+            import termios
+            import tty
+            interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        except ImportError:  # not a POSIX terminal
+            interactive = False
+        if not interactive or self.active:
+            yield
+            return
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        stop = threading.Event()
+        real = sys.stdout, sys.stderr
+        thread = threading.Thread(target=self._watch, args=(fd, stop, deliver), daemon=True)
+        self.active, self.column = (fd, saved, stop, thread, real), 0
+        sys.stdout, sys.stderr = Gate(real[0], self), Gate(real[1], self)
+        tty.setcbreak(fd)  # keys arrive one at a time and unechoed; Ctrl-C still interrupts
+        thread.start()
+        try:
+            yield
+        finally:
+            self.idle()
+
+    def idle(self):
+        """Stop listening for steering and give the terminal back (when the turn ends, or before a reload)."""
+        if not self.active:
+            return
+        import termios
+        fd, saved, stop, thread, real = self.active
+        stop.set()
+        thread.join(1)
+        if self.typing:
+            self._prompt_close()  # the draft is kept for the next prompt
+        self.active = None
+        sys.stdout, sys.stderr = real
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    def _watch(self, fd, stop, deliver):
+        decode = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+        while not stop.is_set():
+            if not select.select([fd], [], [], 0.1)[0]:
+                continue
+            try:
+                chunk = decode.decode(os.read(fd, 1024))
+            except OSError:
+                return
+            i = 0
+            while i < len(chunk):
+                ch, i = chunk[i], i + 1
+                if ch == "\x1b":
+                    if i == len(chunk):  # Esc on its own cancels
+                        if self.typing:
+                            self.draft = ""
+                            self._prompt_close()
+                    else:  # arrow keys and friends: skip the whole sequence
+                        m = re.match(r"\[[0-9;?]*[ -/]*[@-~]|O.|.", chunk[i:], re.S)
+                        i += m.end() if m else 0
+                elif not self.typing:
+                    if ch.isprintable():
+                        self.draft += ch
+                        self._prompt_open()
+                elif ch in "\r\n":
+                    text, self.draft = self.draft.strip(), ""
+                    self._prompt_close()
+                    if text:
+                        deliver(text)
+                else:
+                    if ch in "\x7f\x08":
+                        self.draft = self.draft[:-1]
+                    elif ch == "\x15":  # Ctrl-U
+                        self.draft = ""
+                    elif ch == "\x17":  # Ctrl-W
+                        self.draft = re.sub(r"\S*\s*$", "", self.draft)
+                    elif ch.isprintable():
+                        self.draft += ch
+                    self._prompt_draw()
+
+    def _prompt_open(self):
+        with self.lock:
+            self.typing = True
+            self.lifted = self.column > 0  # the output's last line isn't finished: prompt goes below it
+            out = self.active[4][1]
+            out.write("\n" if self.lifted else "\r")
+            self._paint(out)
+
+    def _prompt_draw(self):
+        with self.lock:
+            if self.typing:
+                self._paint(self.active[4][1])
+
+    def _paint(self, out):
+        label = style("↳ steer", "bold", "magenta") + style(" · enter queues it for the next step, esc cancels ", "gray")
+        room = max(10, width() - vlen(label) - 3)
+        shown = self.draft[-room:]
+        bar = f"\x1b[{BAR}m" if COLOR else ""
+        out.write(f"\r{bar}\x1b[K {label}{shown}\x1b[0m")
+        out.flush()
+
+    def _prompt_close(self):
+        """Remove the prompt, put the cursor back where the output left it, and release the held output."""
+        with self.lock:
+            out = self.active[4][1]
+            out.write("\r\x1b[K\x1b[0m")
+            if self.lifted:
+                out.write(f"\x1b[1A\x1b[{self.column % width() + 1}G")
+            self.typing = False
+            for stream, text in self.held:
+                stream.write(text)
+                self.track(text)
+            self.held.clear()
+            for stream in self.active[4]:
+                stream.flush()
 
     def stream(self, kind, text):
         """Show model output as it arrives; kind is "reasoning" or "text"."""

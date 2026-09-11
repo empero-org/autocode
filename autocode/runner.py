@@ -9,6 +9,7 @@ compiles, re-execs itself and resumes the session where it left off.
 Stdlib only. Works with any OpenAI-compatible /chat/completions endpoint.
 """
 import argparse
+import contextlib
 import http.client
 import importlib.util
 import json
@@ -146,6 +147,15 @@ except ImportError:
         def note(self, text, color=None):
             self.end()
             print(text, file=sys.stderr, flush=True)
+
+        def steered(self, text):
+            print(f"\n> {text}", file=sys.stderr, flush=True)
+
+        def working(self, deliver):  # steering needs the printing kernel
+            return contextlib.nullcontext()
+
+        def idle(self):
+            pass
 
 view = View()
 
@@ -380,6 +390,7 @@ class Agent:
             if self.file.exists() else []
         self.tokens, self.counted = 0, 0  # last API token count, and how many messages it covers
         self.floor = 0  # after a compaction that failed or didn't shrink enough, don't retry below this size
+        self.queue = []  # messages you typed while it worked, delivered before its next step
         self.seen = START_SRC  # last version of this file already reported as broken
 
     # -- persistence
@@ -415,8 +426,9 @@ class Agent:
         try:
             if prompt is not None:
                 self.add({"role": "user", "content": prompt})
-            while self.step():
-                pass
+            with view.working(self.queue.append):
+                while self.step() or self.queue:  # a message typed at the very end still gets an answer
+                    pass
             return True
         except KeyboardInterrupt:
             view.note("[interrupted]", "yellow")
@@ -427,6 +439,7 @@ class Agent:
 
     def step(self):
         """One model call plus the tools it asks for. Returns True while the turn goes on."""
+        self.inject()
         self.reload_if_changed()
         if self.context() > max(self.limit(), self.floor):
             try:
@@ -456,6 +469,13 @@ class Agent:
         for call in message.get("tool_calls") or []:
             self.add({"role": "tool", "tool_call_id": call["id"], "content": self.run_tool(tools, call)})
         return bool(message.get("tool_calls"))
+
+    def inject(self):
+        """Deliver messages you typed while the agent was working, ahead of its next model call."""
+        while self.queue:
+            text = self.queue.pop(0)
+            view.steered(text)
+            self.add({"role": "user", "content": text})
 
     def call(self, tools):
         return chat(self.cfg, [self.system(), *self.messages], [schema for schema, _ in tools.values()], view.stream)
@@ -576,6 +596,7 @@ class Agent:
 
     def reload(self, continue_turn=False):
         """Re-exec this file and resume the session; continue_turn picks the running turn back up."""
+        view.idle()  # give the terminal back first: the new process expects it in its normal mode
         save_history()
         args = ["--resume", self.sid] if self.file.exists() else []
         args += ["--continue-turn"] if continue_turn else []
@@ -619,6 +640,8 @@ def repl(agent):
             continue
         if handled is None:
             agent.turn(line)
+            while agent.queue:  # sent just as the turn ended
+                agent.turn()
         else:
             agent = handled
     save_history()
@@ -634,7 +657,8 @@ HELP = """\
 /reset                 update runner.py to the installed version (yours is backed up) and reload
 /compact               summarize the conversation now
 /new                   start a new session
-/exit                  quit (or Ctrl-D) · end a line with \\ to continue it"""
+/exit                  quit (or Ctrl-D) · end a line with \\ to continue it
+While it works, just type: your message is queued and delivered before its next step."""
 
 listed = []  # the models shown by the last /model, so that /model <number> can pick one
 

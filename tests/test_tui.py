@@ -1,5 +1,8 @@
 """Unit tests for the printing kernel (autocode/tui.py)."""
 import io
+import os
+import threading
+import time
 import unittest
 
 from autocode import tui
@@ -93,6 +96,62 @@ class KernelTest(unittest.TestCase):
         md.feed("# raw *markdown*")
         md.end()
         self.assertEqual(out.getvalue(), "# raw *markdown*\n")
+
+
+def wait_for(condition, timeout=2.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+class SteeringTest(unittest.TestCase):
+    """Typing while the agent works: keys arrive on a pipe instead of a terminal."""
+
+    def setUp(self):
+        self.view, self.out, self.got = tui.View(), io.StringIO(), []
+        self.stop = threading.Event()
+        self.view.active = (None, None, self.stop, None, (self.out, self.out))
+        self.read, self.write = os.pipe()
+        thread = threading.Thread(target=self.view._watch, args=(self.read, self.stop, self.got.append), daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (self.stop.set(), thread.join(1), os.close(self.read), os.close(self.write)))
+
+    def keys(self, data):
+        os.write(self.write, data)
+
+    def test_typing_queues_a_message_and_holds_output_meanwhile(self):
+        self.view.column = 5  # the output's last line is unfinished
+        gate = tui.Gate(self.out, self.view)
+        self.keys(b"hi")
+        self.assertTrue(wait_for(lambda: self.view.typing))
+        gate.write("held")
+        self.assertNotIn("held", self.out.getvalue())  # output waits while you type
+        self.keys(b"\x7fey\r")  # backspace, then Enter
+        self.assertTrue(wait_for(lambda: self.got))
+        self.assertEqual(self.got, ["hey"])
+        self.assertIn(f"\x1b[1A\x1b[{5 % tui.width() + 1}G", self.out.getvalue())  # cursor back where it was
+        self.assertTrue(self.out.getvalue().endswith("held"))  # then the held output follows
+
+    def test_escape_cancels_and_arrow_keys_are_ignored(self):
+        self.keys(b"x")
+        self.assertTrue(wait_for(lambda: self.view.typing))
+        self.keys(b"\x1b[D")  # left arrow: skipped, the prompt stays open
+        time.sleep(0.1)
+        self.assertEqual(self.view.draft, "x")
+        self.keys(b"\x1b")
+        self.assertTrue(wait_for(lambda: not self.view.typing))
+        self.assertEqual((self.got, self.view.draft), ([], ""))
+
+    def test_track_follows_the_cursor_column(self):
+        self.view.track("abc\ndef")
+        self.assertEqual(self.view.column, 3)
+        self.view.track("\x1b[1mgh\x1b[22m")
+        self.assertEqual(self.view.column, 5)
+        self.view.track("\r\x1b[2A\x1b[J")  # the live region erasing itself
+        self.assertEqual(self.view.column, 0)
 
 
 if __name__ == "__main__":
